@@ -60,6 +60,7 @@ struct WorkerLocalityInfo {
     llc_end_ix: usize,
     numa_start_ix: usize,
     numa_end_ix: usize,
+    sibling_llcs: bool,
 }
 
 /// ////////////////////////////////////////////////////////////////////////
@@ -171,6 +172,7 @@ impl Registry {
         for (numa_domain, llcs) in hierarchy.iter().enumerate() {
             let numa_start_ix = locality_lookup.len();
             let numa_end_ix = numa_start_ix + llcs.iter().map(|cpus| cpus.len()).sum::<usize>();
+            let sibling_llcs = llcs.iter().filter(|cpus| !cpus.is_empty()).count() > 1;
             for (llc_domain, cpus) in llcs.iter().enumerate() {
                 let llc_start_ix = locality_lookup.len();
                 let llc_end_ix = llc_start_ix + cpus.len();
@@ -182,6 +184,7 @@ impl Registry {
                         llc_end_ix,
                         numa_start_ix,
                         numa_end_ix,
+                        sibling_llcs,
                     };
                     locality_lookup.push(locality);
                 }
@@ -723,7 +726,7 @@ impl WorkerThread {
             }
         }
 
-        let do_numa = self.locality_info.numa_start_ix > 0 || num_threads > self.locality_info.numa_end_ix;
+        let try_sibling_llcs = self.locality_info.sibling_llcs && self.locality_info.numa_start_ix > 0 || num_threads > self.locality_info.numa_end_ix;
 
         let llc_local_rng = RngIter { rng: &self.rng, max: llc_local_range.len() }
             .map(|ix| ix + self.locality_info.llc_start_ix)
@@ -731,7 +734,7 @@ impl WorkerThread {
         let numa_local_rng = RngIter { rng: &self.rng, max: numa_local_range.len() }
             .map(|ix| ix + self.locality_info.numa_start_ix)
             .filter(|&i| i < self.locality_info.llc_start_ix || i >= self.locality_info.llc_end_ix)
-            .take(if do_numa { 2 } else { 0 });
+            .take(if try_sibling_llcs { 2 } else { 0 });
 
         llc_local_rng
             .chain(llc_local_range)

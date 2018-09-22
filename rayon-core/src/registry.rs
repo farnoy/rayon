@@ -1,5 +1,6 @@
 use ::{ExitHandler, PanicHandler, StartHandler, ThreadPoolBuilder, ThreadPoolBuildError, ErrorKind};
 use crossbeam_deque::{Deque, Steal, Stealer};
+use hwloc;
 use job::{JobRef, StackJob};
 #[cfg(rayon_unstable)]
 use job::Job;
@@ -12,6 +13,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
+use std::iter::once;
 use std::sync::{Arc, Mutex, Once, ONCE_INIT};
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT, Ordering};
 use std::thread;
@@ -47,6 +49,17 @@ pub struct Registry {
 
 struct RegistryState {
     job_injector: Deque<JobRef>,
+}
+
+#[derive(Clone, Debug)]
+struct WorkerLocalityInfo {
+    numa_domain: u32,
+    llc_domain: u32,
+    cpu_index: u32,
+    llc_start_ix: usize,
+    llc_end_ix: usize,
+    numa_start_ix: usize,
+    numa_end_ix: usize,
 }
 
 /// ////////////////////////////////////////////////////////////////////////
@@ -97,7 +110,85 @@ impl<'a> Drop for Terminator<'a> {
 
 impl Registry {
     pub fn new(mut builder: ThreadPoolBuilder) -> Result<Arc<Registry>, ThreadPoolBuildError> {
-        let n_threads = builder.get_num_threads();
+        let topology = hwloc::Topology::new();
+        println!("topo cpuset {:?}", topology.get_cpubind(hwloc::CPUBIND_PROCESS));
+        println!("topo cpuset raw {:?}", topology.get_cpubind(hwloc::CPUBIND_PROCESS).unwrap().into_iter().collect::<Vec<_>>());
+        println!("walking topology");
+        let allowed_cpuset = topology.get_cpubind(hwloc::CPUBIND_PROCESS).unwrap();;
+        let mut hierarchy: Vec<Vec<Vec<u32>>> = vec![];
+        fn find_parent_of_type(object: &hwloc::TopologyObject, typ: hwloc::ObjectType) -> Option<&hwloc::TopologyObject> {
+            match object.parent() {
+                Some(parent) if parent.object_type() == typ => Some(parent),
+                Some(parent) => find_parent_of_type(parent, typ),
+                None => None,
+            }
+        }
+        fn find_parent_llc(object: &hwloc::TopologyObject) -> Option<&hwloc::TopologyObject> {
+            match object.parent() {
+                Some(parent) if parent.object_type() == hwloc::ObjectType::Cache && parent.cache_attributes().unwrap().depth == 3 => Some(parent),
+                Some(parent) => find_parent_llc(parent),
+                None => None,
+            }
+        }
+        fn walk_topo(allowed_cpuset: &hwloc::CpuSet, hierarchy: &mut Vec<Vec<Vec<u32>>>, object: &hwloc::TopologyObject) {
+            let prefix = "  ".repeat(object.depth() as usize);
+            /*
+            let cache_level = match (object.object_type(), object.cache_attributes()) {
+                (hwloc::ObjectType::Cache, Some(attrs)) => Some(attrs.depth),
+                _ => None
+            };
+            let numa_domain = match (object.object_type(), object.sibling_rank()) {
+                (hwloc::ObjectType::NUMANode, rank) => Some(rank),
+                _ => None
+            }.unwrap();
+            */
+            if object.object_type() == hwloc::ObjectType::PU {
+                let numa_domain = find_parent_of_type(object, hwloc::ObjectType::NUMANode).unwrap().sibling_rank();
+                let llc_domain = find_parent_llc(object).unwrap().sibling_rank();
+                // println!("{} {:?} #{} {} {} {:?}", prefix, object.object_type(), object.os_index(), numa_domain, llc_domain, object.allowed_cpuset());
+                if hierarchy.get(numa_domain as usize).is_none() {
+                    hierarchy.push(vec![]);
+                }
+                let llc_hierarchy = hierarchy.get_mut(numa_domain as usize).unwrap();
+                if llc_hierarchy.get(llc_domain as usize).is_none() {
+                    llc_hierarchy.push(vec![]);
+                }
+                let cpu_list = llc_hierarchy.get_mut(llc_domain as usize).unwrap();
+                if allowed_cpuset.is_set(object.os_index()) {
+                    cpu_list.push(object.os_index());
+                }
+            }
+            for child in object.children().iter() {
+                walk_topo(allowed_cpuset, hierarchy, child);
+            }
+        }
+        walk_topo(&allowed_cpuset, &mut hierarchy, topology.object_at_root());
+        println!("hierarchy {:?}", hierarchy);
+        // panic!("quit for now");
+        // let n_threads = builder.get_num_threads();
+        let n_threads = hierarchy.iter().map(|llc_domain| llc_domain.iter().map(|cpus| cpus.len()).sum::<usize>()).sum();
+        let mut locality_lookup: Vec<WorkerLocalityInfo> = Vec::with_capacity(n_threads);
+        for (numa_domain, llcs) in hierarchy.iter().enumerate() {
+            let numa_start_ix = locality_lookup.len();
+            let numa_end_ix = numa_start_ix + llcs.iter().map(|cpus| cpus.len()).sum::<usize>();
+            for (llc_domain, cpus) in llcs.iter().enumerate() {
+                let llc_start_ix = locality_lookup.len();
+                let llc_end_ix = llc_start_ix + cpus.len();
+                for cpu_index in cpus.iter().cloned() {
+                    let locality = WorkerLocalityInfo {
+                        numa_domain: numa_domain as u32,
+                        llc_domain: llc_domain as u32, cpu_index,
+                        llc_start_ix,
+                        llc_end_ix,
+                        numa_start_ix,
+                        numa_end_ix,
+                    };
+                    locality_lookup.push(locality);
+                }
+            }
+        }
+        println!("n_threads {}", n_threads);
+        // println!("locality_lookup {:?}", locality_lookup);
         let breadth_first = builder.get_breadth_first();
 
         let inj_worker = Deque::new();
@@ -123,7 +214,7 @@ impl Registry {
         // If we return early or panic, make sure to terminate existing threads.
         let t1000 = Terminator(&registry);
 
-        for (index, worker) in workers.into_iter().enumerate() {
+        for (index, (worker, locality)) in workers.into_iter().zip(locality_lookup.into_iter()).enumerate() {
             let registry = registry.clone();
             let mut b = thread::Builder::new();
             if let Some(name) = builder.get_thread_name(index) {
@@ -132,7 +223,11 @@ impl Registry {
             if let Some(stack_size) = builder.get_stack_size() {
                 b = b.stack_size(stack_size);
             }
-            if let Err(e) = b.spawn(move || unsafe { main_loop(worker, registry, index, breadth_first) }) {
+            if let Err(e) = b.spawn(move || unsafe {
+                let mut topology = hwloc::Topology::new();
+                topology.set_cpubind(hwloc::CpuSet::from(locality.cpu_index), hwloc::CPUBIND_THREAD).unwrap();
+                main_loop(worker, locality, registry, index, breadth_first)
+               }) {
                 return Err(ThreadPoolBuildError::new(ErrorKind::IOError(e)))
             }
         }
@@ -455,6 +550,8 @@ pub struct WorkerThread {
     /// the "worker" half of our local deque
     worker: Deque<JobRef>,
 
+    locality_info: WorkerLocalityInfo,
+
     index: usize,
 
     /// are these workers configured to steal breadth-first or not?
@@ -604,9 +701,41 @@ impl WorkerThread {
             return None;
         }
 
-        let start = self.rng.next_usize(num_threads);
-        (start .. num_threads)
-            .chain(0 .. start)
+        let llc_local_range = self.locality_info.llc_start_ix..self.locality_info.llc_end_ix;
+        let numa_local_range = self.locality_info.numa_start_ix..self.locality_info.numa_end_ix;
+
+        let numa_local_range_excluding_llc = numa_local_range
+            .clone()
+            .filter(|&i| i < self.locality_info.llc_start_ix || i >= self.locality_info.llc_end_ix);
+        let fallback_range = (0..num_threads)
+            .filter(|&i| i < self.locality_info.numa_start_ix || i >= self.locality_info.numa_end_ix);
+
+        struct RngIter<'a> {
+            rng: &'a XorShift64Star,
+            max: usize,
+        }
+
+        impl<'a> Iterator for RngIter<'a> {
+            type Item = usize;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                Some(self.rng.next_usize(self.max))
+            }
+        }
+
+        let llc_local_rng = RngIter { rng: &self.rng, max: llc_local_range.len() }
+            .map(|ix| ix + self.locality_info.llc_start_ix)
+            .take(1);
+        let numa_local_rng = RngIter { rng: &self.rng, max: numa_local_range.len() }
+            .map(|ix| ix + self.locality_info.numa_start_ix)
+            .filter(|&i| i < self.locality_info.llc_start_ix || i >= self.locality_info.llc_end_ix)
+            .take(1);
+
+        llc_local_rng
+            .chain(llc_local_range)
+            .chain(numa_local_rng)
+            .chain(numa_local_range_excluding_llc)
+            .chain(fallback_range)
             .filter(|&i| i != self.index)
             .filter_map(|victim_index| {
                 let victim = &self.registry.thread_infos[victim_index];
@@ -631,11 +760,13 @@ impl WorkerThread {
 /// ////////////////////////////////////////////////////////////////////////
 
 unsafe fn main_loop(worker: Deque<JobRef>,
+                    locality_info: WorkerLocalityInfo,
                     registry: Arc<Registry>,
                     index: usize,
                     breadth_first: bool) {
     let worker_thread = WorkerThread {
         worker: worker,
+        locality_info,
         breadth_first: breadth_first,
         index: index,
         rng: XorShift64Star::new(),

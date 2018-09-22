@@ -13,7 +13,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
-use std::iter::empty;
+use std::iter::once;
 use std::sync::{Arc, Mutex, Once, ONCE_INIT};
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT, Ordering};
 use std::thread;
@@ -707,12 +707,6 @@ impl WorkerThread {
         let llc_local_range = self.locality_info.llc_start_ix..self.locality_info.llc_end_ix;
         let numa_local_range = self.locality_info.numa_start_ix..self.locality_info.numa_end_ix;
 
-        let numa_local_range_excluding_llc = numa_local_range
-            .clone()
-            .filter(|&i| i < self.locality_info.llc_start_ix || i >= self.locality_info.llc_end_ix);
-        let fallback_range = (0..num_threads)
-            .filter(|&i| i < self.locality_info.numa_start_ix || i >= self.locality_info.numa_end_ix);
-
         struct RngIter<'a> {
             rng: &'a XorShift64Star,
             max: usize,
@@ -726,21 +720,20 @@ impl WorkerThread {
             }
         }
 
-        let try_sibling_llcs = self.locality_info.sibling_llcs && self.locality_info.numa_start_ix > 0 || num_threads > self.locality_info.numa_end_ix;
+        let try_sibling_llcs = self.locality_info.sibling_llcs && (self.locality_info.numa_start_ix > 0 || num_threads > self.locality_info.numa_end_ix);
 
-        let llc_local_rng = RngIter { rng: &self.rng, max: llc_local_range.len() }
-            .map(|ix| ix + self.locality_info.llc_start_ix)
-            .take(2);
         let numa_local_rng = RngIter { rng: &self.rng, max: numa_local_range.len() }
             .map(|ix| ix + self.locality_info.numa_start_ix)
             .filter(|&i| i < self.locality_info.llc_start_ix || i >= self.locality_info.llc_end_ix)
-            .take(if try_sibling_llcs { 2 } else { 0 });
+            .take(if try_sibling_llcs { 1 } else { 0 });
 
-        llc_local_rng
-            .chain(llc_local_range)
+        let start = self.rng.next_usize(llc_local_range.len()) + self.locality_info.llc_start_ix;
+
+        once(start)
+            .chain(start..self.locality_info.llc_end_ix)
             .chain(numa_local_rng)
-            .chain(numa_local_range_excluding_llc)
-            .chain(fallback_range)
+            .chain(0..self.locality_info.numa_start_ix)
+            .chain(self.locality_info.numa_end_ix..num_threads)
             .filter(|&i| i != self.index)
             .filter_map(|victim_index| {
                 let victim = &self.registry.thread_infos[victim_index];

@@ -13,7 +13,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
-use std::iter::once;
+use std::iter::empty;
 use std::sync::{Arc, Mutex, Once, ONCE_INIT};
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT, Ordering};
 use std::thread;
@@ -723,13 +723,14 @@ impl WorkerThread {
             }
         }
 
+        let do_numa = self.locality_info.numa_start_ix > 0 || num_threads >= self.locality_info.numa_end_ix;
         let llc_local_rng = RngIter { rng: &self.rng, max: llc_local_range.len() }
             .map(|ix| ix + self.locality_info.llc_start_ix)
             .take(1);
         let numa_local_rng = RngIter { rng: &self.rng, max: numa_local_range.len() }
             .map(|ix| ix + self.locality_info.numa_start_ix)
             .filter(|&i| i < self.locality_info.llc_start_ix || i >= self.locality_info.llc_end_ix)
-            .take(1);
+            .take(if do_numa { 2 } else { 0 });
 
         llc_local_rng
             .chain(llc_local_range)

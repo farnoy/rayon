@@ -724,9 +724,10 @@ impl WorkerThread {
         }
 
         let do_numa = self.locality_info.numa_start_ix > 0 || num_threads >= self.locality_info.numa_end_ix;
+        let do_llc = self.locality_info.llc_start_ix > 0 || num_threads >= self.locality_info.llc_end_ix;
         let llc_local_rng = RngIter { rng: &self.rng, max: llc_local_range.len() }
             .map(|ix| ix + self.locality_info.llc_start_ix)
-            .take(1);
+            .take(if do_llc { 2 } else { 0 });
         let numa_local_rng = RngIter { rng: &self.rng, max: numa_local_range.len() }
             .map(|ix| ix + self.locality_info.numa_start_ix)
             .filter(|&i| i < self.locality_info.llc_start_ix || i >= self.locality_info.llc_end_ix)
